@@ -1,0 +1,220 @@
+---
+title: "Weight Lifting Machine Learning"
+author: "Brisbois Fabrice"
+date: "19 November 2015"
+output: html_document
+---
+
+## Overview
+
+**Description**
+
+Using devices such as Jawbone Up, Nike FuelBand, and Fitbit it is now possible to collect a large amount of data about personal activity relatively inexpensively. These type of devices are part of the quantified self movement - a group of enthusiasts who take measurements about themselves regularly to improve their health, to find patterns in their behavior, or because they are tech geeks. One thing that people regularly do is quantify how much of a particular activity they do, but they rarely quantify how well they do it. In this project, the goal will be to use data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants. They were asked to perform barbell lifts correctly and incorrectly in 5 different ways. More information is available from the website: http://groupware.les.inf.puc-rio.br/har. (See the section on the Weight Lifting Exercise Dataset)
+
+**Goal**
+
+The goal of this project is to predict the manner in which the people did the exercises, which is defined in the "classe" variable in the training dataset.
+
+**Data**
+
+Six young health participants were asked to perform one set of 10 repetitions of the Unilateral Dumbbell Biceps Curl in five different fashions, and the data was recorded for evaluation purposes, the 5 classes of their exercise activity are:
+
+  * A: Exactly according to the specification
+  * B: Throwing the elbows to the front
+  * C: Lifting the dumbbell only halfway
+  * D: Lowering the dumbbell only halfway
+  * E: Throwing the hips to the front
+
+```{r libraryload, echo=FALSE,warning=FALSE,message=FALSE,cache=TRUE}
+library(ggplot2)
+library(caret)
+library(rpart) 
+library(rpart.plot) 
+library(rattle)
+library(parallel)
+library(doParallel)
+registerDoParallel(makeCluster(detectCores()-1))
+```
+
+## Data processing
+
+**Downloading**
+
+```{r dowloading, cache=TRUE}
+trainUrl <-"https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+trainFile <- "pml-training.csv"
+if (!file.exists(trainFile)) download.file(trainUrl, destfile=trainFile)
+
+training = read.csv("pml-training.csv",stringsAsFactors=FALSE,na.strings = c("NA",""))
+```
+
+**Exploratory and Cleaning**
+
+Some column contains a lot of missing values. We define a function *missingpct* to evaluate the percentage of missing value. Histogram plot shows clearly two groups of columns. We only keep columns with a percentage of missing value lesser than 20%. We also discard the first 7 columns (name, timestamps,...) which contain irrelevant data for the study. The last column (classe) contains the outcome we would predict.
+
+```{r exploratory, fig.height = 3, cache=TRUE}
+missingpct <- function(x) { sum(is.na(x))/length(x) }
+missingvalues = apply(training,2,missingpct)
+
+ggplot(data.frame(x=missingvalues), aes(x = x)) +
+    geom_histogram(alpha = .5, binwidth=0.05, color="black") +
+    labs(x="Percentage", y="Nbr of columns") +
+    ggtitle("Missing value")
+
+training = training[missingvalues<0.2]
+training = training[-1:-7]
+training$classe <- factor(training$classe)
+```
+
+Datasets come sometimes with predictors that take an unique value across samples or are almost constant across samples. This kind of predictor is not only non-informative, it can break some models you may want to fit to your data. A quick solution is to remove all predictors that satisfy some threshold criterion related to their variance. Our training set does not contain near zero variance predictor anymore. 
+
+```{r nvz, cache=TRUE}
+nzv=nearZeroVar(training[,-53],saveMetrics = TRUE)
+table(nzv$nzv)
+```
+
+## Learning Algorithms
+
+### Data slicing
+
+We partition data into training and validation sets and assign 75% of data for training and 25% for validation set.
+
+```{r slicing, cache=TRUE}
+set.seed(1337)
+
+inTrain <- createDataPartition(y=training$classe, p=0.75, list=FALSE)
+learning <- training[inTrain,]
+validating <-  training[-inTrain,]
+```
+
+### Principal Components Analysis
+
+Principal component analysis (PCA) is a dimensionality reduction technique. It can be used to produce linear combinations of the covariates that are uncorrelated between each other. Reducing the dimensionality of a dataset can be useful to significantly reduce the computational time of some numerical algorithms. We have 52 predictor variables. We can halve this number using PCA and we see that only 25 components are needed to capture 95 percent of the variance.
+
+```{r pca, cache=TRUE}
+PCA = NULL
+for(i in c(0.8,0.9,0.95,0.99)) PCA <- cbind(PCA,preProcess(learning[,-53],method="pca",thresh=i)$numComp )
+PCA <- data.frame(PCA)
+names(PCA) <- c("80%","90%","95%","99%")
+PCA
+
+preProcPCA25 <- preProcess(learning[,-53],method="pca",pcaComp=25)
+preProcPCA12 <- preProcess(learning[,-53],method="pca",pcaComp=12)
+```
+
+In order to predict the "classe" of the exercises, several classification models can be used. We will test three of them :
+
+  - Decision Tree
+  - Random Forest
+  - Stochastic Gradient Boosting 
+
+We will evaluate the performance of the models on the validation data. The Confusion Matrix, the estimated accuracy and the estimated out-of-sample error of the model, are calculated.
+
+### Decision Tree
+
+The classifiers based on decision trees try to find ways to divide the universe into successively more subgroups (creating nodes containing the respective tests) until each addressing only one class or until one of the classes shows a clear majority do not justifying further divisions, generating in this situation a leaf containing the class majority. We tune our Decision Tree model with the tuneLength parameter to achieve a high accuracy. 
+
+```{r decisiontree1, cache=TRUE,warning=FALSE}
+modelTree1 <- train(classe ~ ., data=learning, method = "rpart", tuneLength=30)
+modelTree2 <- train(classe ~ ., data=learning, method = "rpart", tuneLength=60)
+```
+
+|tuneLength   | time (s) | Accuracy |
+| :-:         | :-:      |  :-:     |
+| 30          | 20.88    | 0.8334   |
+| 60          | 26.49    | 0.9156   |
+
+The confusion matrix for the best decision tree model :
+
+```{r decisiontree2, echo=FALSE, cache=TRUE}
+predictTree = predict(modelTree2, validating)
+confusionMatrix(predictTree,validating$classe)
+```
+
+### Random Forest
+
+Random Forest is an ensemble method that creates multiple models of the same type from different sub-samples of the same dataset. The predictions from each separate model are combined together to provide a superior result. Random Forest is a highly cpu intensive model. To get result within short time (minutes), we tune the traincontrol using cross-validation instead of bootstrap.
+
+```{r randomforest1, cache=TRUE,warning=FALSE,message=FALSE}
+modelForest1 <- train(classe ~ ., data = learning, method="rf", trControl = trainControl(method = "cv", number = 3))
+modelForest2 <- train(classe ~ ., data = learning, method="rf", trControl = trainControl(method = "cv", number = 6))
+```
+
+|method | number | time (s) | Accuracy |
+| :-:   | :-:    | :-:      |  :-:     |
+| cv    | 3      | 148.0    | .9943    |
+| cv    | 6      | 230.29   | .9947    |
+
+The confusion matrix for the best random forest model :
+
+```{r randomforest2, cache=TRUE}
+predictForest <- predict(modelForest2,validating)
+confusionMatrix(predictForest,validating$classe)
+```
+
+The time can be significantly reduced using the PCA.
+
+```{r randomforest3, cache=TRUE}
+learningPCA25 = predict(preProcPCA25,learning)
+learningPCA12 = predict(preProcPCA12,learning)
+validatingPCA25 = predict(preProcPCA25,validating)
+validatingPCA12 = predict(preProcPCA12,validating)
+
+modelForestPCA1 <- train(classe ~ ., data = learningPCA25, method="rf", trControl = trainControl(method = "cv", number = 3))
+modelForestPCA2 <- train(classe ~ ., data = learningPCA25, method="rf", trControl = trainControl(method = "cv", number = 6))
+modelForestPCA3 <- train(classe ~ ., data = learningPCA12, method="rf", trControl = trainControl(method = "cv", number = 3))
+```
+
+|components| cv number | time (s) | Accuracy |
+| :-:      | :-:       | :-:      |  :-:     |
+| 25       | 3         | 60.48    | .9782    |
+| 25       | 6         | 116.91   | .9802    |
+| 12       | 3         | 32.98    | .9615    |
+
+The confusion matrix for the best random forest model using PCA :
+
+```{r randomforest4, cache=TRUE}
+predictForest <- predict(modelForestPCA2,validatingPCA25)
+confusionMatrix(predictForest,validatingPCA25$classe)
+```
+
+### Stochastic Gradient Boosting
+
+Boosting is an ensemble method developed for classification for reducing bias where models are added to learn the misclassification errors in existing models. It has been generalized and adapted in the form of Gradient Boosted Machines (GBM) for use with CART decision trees for classification and regression.
+
+```{r boosting1, cache=TRUE,warning=FALSE,message=FALSE}
+modelBoost1 <- train(classe ~ ., data = learning, method="gbm", trControl = trainControl(method = "cv", number = 3),verbose=FALSE)
+modelBoost2 <- train(classe ~ ., data = learning, method="gbm", trControl = trainControl(method = "cv", number = 3),verbose=FALSE)
+```
+
+|method | number | time (s) | Accuracy |
+| :-:   | :-:    | :-:      |  :-:     |
+| cv    | 3      | 58.19    | .9653    |
+| cv    | 6      | 95.43    | .9655    |
+
+The confusion matrix for the best stochastic Ggradient boosting model :
+
+```{r boosting2, cache=TRUE}
+predictBoost <- predict(modelBoost2,validating)
+confusionMatrix(predictBoost,validating$classe)
+```
+
+## Results
+
+After some initial testing we choose Random Forest algorithm as the accuracy rate of this algorithm was way better than other algorithms. 
+
+```{r result, cache=TRUE}
+testing <- read.csv("pml-testing.csv",stringsAsFactors=FALSE,na.strings = c("NA",""))
+testing = testing[missingvalues<0.2]
+testing <- testing[-1:-7]
+testing <- testing[-53]
+
+answerTree = as.character(predict(modelTree2,newdata = testing))
+answerForest = as.character(predict(modelForest2,newdata = testing))
+answerBoost = as.character(predict(modelBoost2,newdata = testing))
+cbind(answerTree,answerForest,answerBoost)
+```
+
+Stochastic Gradient Boosting and Random Forest predict the same values for the test sample. It confirms that the models are very good to predict the "classe" of the weight lifting exercises. The Decision Tree algorithm fails to predict the good classe two times (8 and 11).
+ 
+
